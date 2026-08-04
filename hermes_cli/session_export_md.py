@@ -161,7 +161,18 @@ def _export_body_without_hash(session: dict[str, Any], *, fmt: str, exported_at:
 
 
 def _body_for_digest(text: str) -> str:
-    return _SHA_LINE_RE.sub("- SHA256 of exported body: `pending`", text)
+    """Replace only the footer SHA line (last match) with ``pending``.
+
+    Session content (tool output quoting other exports) can contain SHA256
+    lines matching the same regex.  Using ``re.sub`` (all occurrences) would
+    also replace those embedded lines, producing a different digest than the
+    one computed at export time (which only replaced the placeholder).
+    """
+    matches = list(_SHA_LINE_RE.finditer(text))
+    if not matches:
+        return text
+    last = matches[-1]
+    return text[: last.start()] + "- SHA256 of exported body: `pending`" + text[last.end() :]
 
 
 def render_session_markdown(
@@ -172,10 +183,22 @@ def render_session_markdown(
         raise ValueError("fmt must be 'md' or 'qmd'")
     exported_at = time.time()
     body = _export_body_without_hash(session, fmt=fmt, exported_at=exported_at)
-    digest_body = body.replace("`__SHA256_PLACEHOLDER__`", "`pending`")
-    digest = hashlib.sha256(digest_body.encode("utf-8")).hexdigest()
+    # Replace only the footer placeholder (last occurrence) so embedded
+    # copies of the placeholder inside session content (e.g. tool output
+    # quoting this module's source) don't alter the digest.
+    placeholder = "`__SHA256_PLACEHOLDER__`"
+    footer_pos = body.rfind(placeholder)
+    if footer_pos == -1:
+        # No placeholder — shouldn't happen, but compute digest of full body.
+        digest_body = body
+        digest = hashlib.sha256(digest_body.encode("utf-8")).hexdigest()
+    else:
+        digest_body = body[:footer_pos] + "`pending`" + body[footer_pos + len(placeholder) :]
+        digest = hashlib.sha256(digest_body.encode("utf-8")).hexdigest()
     if include_verification:
-        return body.replace("__SHA256_PLACEHOLDER__", digest)
+        if footer_pos != -1:
+            return body[:footer_pos] + "`" + digest + "`" + body[footer_pos + len(placeholder) :]
+        return body
     before_verification = body.split("\n## Export verification\n", 1)[0].rstrip() + "\n"
     return before_verification
 
@@ -202,9 +225,10 @@ def verify_export_file(path: Path | str, session: dict[str, Any]) -> tuple[bool,
     if not p.exists():
         return False, "file missing"
     text = p.read_text(encoding="utf-8")
-    match = _SHA_LINE_RE.search(text)
-    if not match:
+    matches = list(_SHA_LINE_RE.finditer(text))
+    if not matches:
         return False, "sha256 marker missing"
+    match = matches[-1]  # footer is always the last SHA line
     actual = hashlib.sha256(_body_for_digest(text).encode("utf-8")).hexdigest()
     if actual != match.group(1):
         return False, "sha256 mismatch"
