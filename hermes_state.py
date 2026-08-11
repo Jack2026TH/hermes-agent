@@ -4575,6 +4575,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            # Guard: if parent_session_id refers to a session that never made it
+            # into state.db (its own create_session failed and was deferred to
+            # self-heal), the FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+            # constraint would reject the INSERT and cascade: every subsequent
+            # reset fails the same way until self-heal fires. Nullify the parent
+            # link when the parent row is missing — the lineage is nice-to-have
+            # for compression history, not worth breaking session creation over.
+            _parent_session_id = parent_session_id
+            if _parent_session_id:
+                _parent_exists = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (_parent_session_id,),
+                ).fetchone()
+                if not _parent_exists:
+                    _parent_session_id = None
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
@@ -4635,7 +4650,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt_hash,
-                    parent_session_id,
+                    _parent_session_id,
                     cwd,
                     profile_name,
                     git_repo_root,
@@ -4646,7 +4661,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if system_prompt_hash is not None:
                 self._delete_unreferenced_system_prompts(conn)
-            if parent_session_id:
+            if _parent_session_id:
                 conn.execute(
                     """UPDATE sessions
                        SET cwd = COALESCE(sessions.cwd,
