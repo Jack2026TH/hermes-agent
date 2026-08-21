@@ -20176,6 +20176,7 @@ def main(
     max_turns: int = None,
     verbose: Optional[bool] = None,
     quiet: bool = False,
+    result_envelope: bool = False,
     compact: bool = False,
     list_tools: bool = False,
     list_toolsets: bool = False,
@@ -20204,6 +20205,7 @@ def main(
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
         verbose: Enable verbose logging
+        result_envelope: Emit one controlled machine-readable result to stderr in single-query mode
         compact: Use compact display mode
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
@@ -20223,6 +20225,10 @@ def main(
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
     global _active_worktree
+
+    from hermes_cli.result_envelope import ResultEnvelopeEmitter
+
+    _result_envelope_emitter = ResultEnvelopeEmitter(result_envelope)
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
@@ -20535,7 +20541,19 @@ def main(
         # waiting the full timeout. See #86878.
         os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
+            _result_envelope_emitter.emit(
+                result=None,
+                session_id=cli.session_id,
+                model=getattr(cli, "model", model),
+                provider=getattr(cli, "provider", provider),
+                reasoning_effort=reasoning,
+                status_override="failed",
+                termination_reason="session_claim_failed",
+            )
             sys.exit(1)
+        _envelope_result = None
+        _envelope_status_override = "failed"
+        _envelope_termination_reason = "startup_failed"
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
@@ -20659,9 +20677,14 @@ def main(
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            _envelope_status_override = "interrupted"
+                            _envelope_termination_reason = "keyboard_interrupt"
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
+                        _envelope_result = result if isinstance(result, dict) else None
+                        _envelope_status_override = None
+                        _envelope_termination_reason = None
                         # Sync session_id if mid-run compression created a
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without
@@ -20753,7 +20776,18 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _envelope_status_override = "succeeded"
+                _envelope_termination_reason = "human_single_query_completed"
         finally:
+            _result_envelope_emitter.emit(
+                result=_envelope_result,
+                session_id=cli.session_id,
+                model=getattr(cli, "model", model),
+                provider=getattr(cli, "provider", provider),
+                reasoning_effort=reasoning,
+                status_override=_envelope_status_override,
+                termination_reason=_envelope_termination_reason,
+            )
             _finalize_single_query(cli)
         return
     

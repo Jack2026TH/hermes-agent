@@ -3213,6 +3213,7 @@ def cmd_chat(args):
         "skills": getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
+        "result_envelope": getattr(args, "result_envelope", False),
         "query": args.query,
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),

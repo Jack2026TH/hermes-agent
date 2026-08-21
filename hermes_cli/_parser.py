@@ -382,6 +382,15 @@ def build_top_level_parser():
         help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info.",
     )
     chat_parser.add_argument(
+        "--result-envelope",
+        action="store_true",
+        default=False,
+        help=(
+            "Single-query mode only: emit one controlled Paperclip result "
+            "envelope to stderr. Response text and secrets are never included."
+        ),
+    )
+    chat_parser.add_argument(
         "--resume",
         "-r",
         metavar="SESSION_ID",
