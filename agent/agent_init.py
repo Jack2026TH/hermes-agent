@@ -2446,14 +2446,44 @@ def init_agent(
             )
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
+    _compression_kwargs = {
+        "model": agent.model,
+        "threshold_percent": compression_threshold,
+        "protect_first_n": compression_protect_first,
+        "protect_last_n": compression_protect_last,
+        "summary_target_ratio": compression_target_ratio,
+        "summary_model_override": None,
+        "quiet_mode": agent.quiet_mode,
+        "base_url": agent.base_url,
+        "api_key": getattr(agent, "api_key", ""),
+        "config_context_length": _effective_context_length,
+        "provider": agent.provider,
+        "api_mode": agent.api_mode,
+        "abort_on_summary_failure": compression_abort_on_summary_failure,
+        "max_tokens": agent.max_tokens,
+        "model_thresholds": compression_model_thresholds,
+        "threshold_tokens_cap": compression_threshold_tokens,
+        "proactive_prune_tokens": compression_proactive_prune_tokens,
+        "proactive_prune_min_result_chars": compression_proactive_prune_min_chars,
+        "proactive_prune_min_reclaim_tokens": compression_proactive_prune_min_reclaim,
+        "min_tail_user_messages": compression_min_tail_users,
+    }
+
     if _selected_engine is not None:
+        # Observer engines layered on ContextCompressor can opt in to the
+        # host's exact compression policy. Other plugins own their own policy.
+        _configure_host_compression = getattr(
+            _selected_engine, "configure_host_compression", None
+        )
+        _inherits_host_compression = callable(_configure_host_compression)
+        if _inherits_host_compression:
+            _configure_host_compression(**_compression_kwargs)
         agent.context_compressor = _selected_engine
-        # External engines own compaction policy: the host compression
-        # threshold (including the Codex gpt-5.5 autoraise above) only
-        # configures the built-in ContextCompressor and never reaches the
-        # plugin, so the autoraise notice would announce a change that does
-        # not apply. Drop it. (#44439)
-        agent._compression_threshold_autoraised = None
+        # Engines without the opt-in hook own their compaction policy. The
+        # host threshold (including the Codex gpt-5.5 autoraise) does not
+        # reach them, so suppress the notice only for those engines. (#44439)
+        if not _inherits_host_compression:
+            agent._compression_threshold_autoraised = None
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length
         _plugin_ctx_len = get_model_context_length(
@@ -2485,28 +2515,7 @@ def init_agent(
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
-        agent.context_compressor = ContextCompressor(
-            model=agent.model,
-            threshold_percent=compression_threshold,
-            protect_first_n=compression_protect_first,
-            protect_last_n=compression_protect_last,
-            summary_target_ratio=compression_target_ratio,
-            summary_model_override=None,
-            quiet_mode=agent.quiet_mode,
-            base_url=agent.base_url,
-            api_key=getattr(agent, "api_key", ""),
-            config_context_length=_effective_context_length,
-            provider=agent.provider,
-            api_mode=agent.api_mode,
-            abort_on_summary_failure=compression_abort_on_summary_failure,
-            max_tokens=agent.max_tokens,
-            model_thresholds=compression_model_thresholds,
-            threshold_tokens_cap=compression_threshold_tokens,
-            proactive_prune_tokens=compression_proactive_prune_tokens,
-            proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
-            proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
-            min_tail_user_messages=compression_min_tail_users,
-        )
+        agent.context_compressor = ContextCompressor(**_compression_kwargs)
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:

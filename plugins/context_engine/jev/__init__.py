@@ -53,6 +53,17 @@ class JevContextEngine(ContextCompressor):
             "reason": "not_run",
         }
 
+    def configure_host_compression(self, **compressor_kwargs: Any) -> None:
+        """Use the same compression policy as the host's built-in compressor."""
+        client = self._client
+        ContextCompressor.__init__(self, **compressor_kwargs)
+        self._client = client
+        self.last_jev_metrics = {
+            "mode": "shadow",
+            "attempted": False,
+            "reason": "not_run",
+        }
+
     @property
     def name(self) -> str:
         return "jev"
