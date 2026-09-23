@@ -12,6 +12,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent.context_compressor import ContextCompressor
+from agent.context_engine import (
+    CONTEXT_ENGINE_OBSERVABILITY_FIELDS,
+    sanitize_context_engine_observability,
+)
 
 from .client import DEFAULT_JEV_MODEL, JevClient, JevError
 
@@ -241,9 +245,33 @@ class JevContextEngine(ContextCompressor):
 
     def get_status(self) -> dict[str, Any]:
         status = super().get_status()
-        status["jev"] = dict(self.last_jev_metrics)
-        status["jev_configured"] = self.is_available()
+        status["jev"] = self.get_observability_status()
         return status
+
+    def get_observability_status(self) -> dict[str, Any]:
+        """Return the content-free Jev metrics safe for gateway status output."""
+        defaults: dict[str, Any] = {
+            "mode": "shadow",
+            "attempted": False,
+            "ok": None,
+            "model": None,
+            "latency_ms": None,
+            "candidates": 0,
+            "would_drop_count": 0,
+            "would_reclaim_chars": 0,
+        }
+        metrics = {
+            field: self.last_jev_metrics.get(field, default)
+            for field, default in defaults.items()
+        }
+        # Keep the field order stable for machine-readable gateway status and
+        # guard the plugin boundary even though the gateway repeats the same
+        # validation before rendering.
+        ordered = {
+            field: metrics[field]
+            for field in CONTEXT_ENGINE_OBSERVABILITY_FIELDS
+        }
+        return sanitize_context_engine_observability(ordered)
 
     def on_session_reset(self) -> None:
         super().on_session_reset()

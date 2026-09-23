@@ -26,6 +26,9 @@ Lifecycle:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+import math
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.redact import redact_sensitive_text
@@ -35,6 +38,88 @@ MEMORY_CONTEXT_MAX_CHARS = 6_000
 _MEMORY_CONTEXT_HEAD_CHARS = 4_000
 _MEMORY_CONTEXT_TAIL_CHARS = 1_500
 _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...\n"
+
+# This is the generic, content-free status contract used by the gateway when
+# a context engine opts into operator-facing observability.  Keep this list
+# deliberately small: the gateway must never render arbitrary plugin-owned
+# status dictionaries, because those may contain prompts, transcript data, or
+# provider error details.
+CONTEXT_ENGINE_OBSERVABILITY_FIELDS = (
+    "mode",
+    "attempted",
+    "ok",
+    "model",
+    "latency_ms",
+    "candidates",
+    "would_drop_count",
+    "would_reclaim_chars",
+)
+_OBSERVABILITY_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$")
+_OBSERVABILITY_MODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_OBSERVABILITY_MAX_COUNT = 1_000_000_000
+
+
+def sanitize_context_engine_observability(status: Any) -> Dict[str, Any]:
+    """Return only bounded, content-free context-engine status fields.
+
+    This is intentionally enforced at the host boundary as well as by
+    individual plugins.  A third-party context engine can therefore expose a
+    status hook without being able to make ``/status`` render arbitrary
+    dictionaries, prompts, transcript excerpts, credentials, or exception
+    text.
+    """
+    if not isinstance(status, Mapping):
+        return {}
+
+    safe: Dict[str, Any] = {}
+    mode = status.get("mode")
+    if isinstance(mode, str) and _OBSERVABILITY_MODE_RE.fullmatch(mode):
+        safe["mode"] = mode
+
+    for field in ("attempted", "ok"):
+        value = status.get(field)
+        if isinstance(value, bool) or value is None:
+            if field in status:
+                safe[field] = value
+
+    model = status.get("model")
+    if model is None:
+        if "model" in status:
+            safe["model"] = None
+    elif isinstance(model, str) and _OBSERVABILITY_IDENTIFIER_RE.fullmatch(model):
+        try:
+            redacted_model = redact_sensitive_text(
+                model,
+                force=True,
+                redact_url_credentials=True,
+            )
+        except Exception:
+            redacted_model = "[redacted]"
+        if redacted_model == model:
+            safe["model"] = model
+
+    latency = status.get("latency_ms")
+    if latency is None:
+        if "latency_ms" in status:
+            safe["latency_ms"] = None
+    elif isinstance(latency, (int, float)) and not isinstance(latency, bool):
+        try:
+            latency_float = float(latency)
+        except (OverflowError, ValueError):
+            latency_float = -1.0
+        if math.isfinite(latency_float) and 0 <= latency_float <= _OBSERVABILITY_MAX_COUNT:
+            safe["latency_ms"] = round(latency_float, 3)
+
+    for field in ("candidates", "would_drop_count", "would_reclaim_chars"):
+        value = status.get(field)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= _OBSERVABILITY_MAX_COUNT
+        ):
+            safe[field] = value
+
+    return {field: safe[field] for field in CONTEXT_ENGINE_OBSERVABILITY_FIELDS if field in safe}
 
 
 def sanitize_memory_context(memory_context: str) -> str:
@@ -452,6 +537,18 @@ class ContextEngine(ABC):
             ),
             "compression_count": self.compression_count,
         }
+
+    def get_observability_status(self) -> Dict[str, Any]:
+        """Return optional, content-free metrics for gateway status output.
+
+        Engines that opt in must return only scalar values from the generic
+        observability contract.  The gateway applies
+        :func:`sanitize_context_engine_observability` again before rendering,
+        so a plugin cannot accidentally expose transcript content or secret
+        material through ``/status``.  The default keeps existing engines
+        completely silent and preserves the narrow generic hook.
+        """
+        return {}
 
     # -- Optional: model switch support ------------------------------------
 
