@@ -4,7 +4,7 @@ This context engine runs a bounded TypeSafe Jev evaluation over selected older
 tool results in long sessions. It is observation-only: Jev's decisions are
 reported as shadow metrics and never remove, rewrite, or reorder messages sent
 to the configured Hermes model. Hermes' normal `ContextCompressor` remains
-active.
+active with the host's configured compression policy.
 
 ## Enable
 

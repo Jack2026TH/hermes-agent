@@ -7,6 +7,7 @@ context_length, causing the CLI status bar to show 'ctx --'.
 from unittest.mock import MagicMock, patch
 
 from agent.context_engine import ContextEngine
+from plugins.context_engine.jev import JevClient, JevContextEngine
 
 
 class _StubEngine(ContextEngine):
@@ -210,3 +211,96 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
     assert agent._compression_warning and "85%" in agent._compression_warning
 
 
+def test_jev_observer_inherits_host_compression_policy(tmp_path, monkeypatch):
+    """Load real config and the real Jev plugin through AIAgent initialization."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_text = (
+        "context:\n"
+        "  engine: jev\n"
+        "compression:\n"
+        "  enabled: true\n"
+        "  threshold: 0.05\n"
+        "  protect_first_n: 2\n"
+        "  protect_last_n: 8\n"
+        "  target_ratio: 0.15\n"
+        "  abort_on_summary_failure: true\n"
+    )
+    config_path.write_text(config_text)
+
+    with (
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    engine = agent.context_compressor
+    assert isinstance(engine, JevContextEngine)
+    assert engine.is_available() is False
+
+    config_path.write_text(config_text.replace("engine: jev", "engine: compressor"))
+    with (
+        patch("agent.context_compressor.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        baseline = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    for field in (
+        "_config_threshold_percent",
+        "protect_first_n",
+        "protect_last_n",
+        "summary_target_ratio",
+        "abort_on_summary_failure",
+        "threshold_tokens_cap",
+        "proactive_prune_tokens",
+        "min_tail_user_messages",
+    ):
+        assert getattr(engine, field) == getattr(baseline.context_compressor, field)
+    assert engine.context_length == baseline.context_compressor.context_length
+
+
+def test_codex_gpt55_autoraise_applies_to_jev_observer():
+    engine = JevContextEngine(client=JevClient(token=""))
+    cfg = {
+        "context": {"engine": "jev"},
+        "compression": {"enabled": True, "threshold": 0.50},
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.context_engine.load_context_engine", return_value=engine),
+        patch("agent.model_metadata.get_model_context_length", return_value=272_000),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(**_codex_agent_kwargs())
+
+    assert agent.context_compressor is engine
+    assert agent._compression_threshold_autoraised == {
+        "model": "gpt-5.5", "from": 0.50, "to": 0.85
+    }
+    assert engine.threshold_percent == 0.85
