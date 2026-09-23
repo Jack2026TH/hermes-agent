@@ -1,0 +1,11 @@
+name: jev
+version: 0.1.0
+description: Typed TypeSafe Choice, Score, and Noul decisions with request-only context selection.
+author: Hermes Agent
+kind: context_engine
+requires:
+  - JEV_API_KEY
+optional:
+  - JEV_API_URL
+  - JEV_MODEL
+  - JEV_CONTEXT_MAX_MESSAGES
