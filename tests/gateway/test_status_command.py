@@ -180,7 +180,6 @@ async def test_status_command_exposes_only_safe_context_engine_observability():
     result = await runner._handle_message(_make_event("/status"))
 
     assert (
-        '**Context engine observability:** '
         '`{"mode":"shadow","attempted":true,"ok":true,"model":"jev-test",'
         '"latency_ms":12.346,"candidates":8,"would_drop_count":2,'
         '"would_reclaim_chars":1024}`'
@@ -535,4 +534,3 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-

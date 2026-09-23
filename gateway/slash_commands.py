@@ -707,14 +707,8 @@ class GatewaySlashCommandsMixin:
             lines.append(context_line)
         if context_engine_observability:
             lines.append(
-                t(
-                    "gateway.status.context_engine_observability",
-                    status=json.dumps(
-                        context_engine_observability,
-                        ensure_ascii=True,
-                        separators=(",", ":"),
-                    ),
-                )
+                "**Context engine observability:** "
+                f"`{json.dumps(context_engine_observability, ensure_ascii=True, separators=(',', ':'))}`"
             )
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
