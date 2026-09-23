@@ -114,6 +114,7 @@ def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(mon
 def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
+    local_ahead_count=None,
     ff_only_fails=False,
     reset_fails=False,
     fetch_fails=False,
@@ -134,7 +135,12 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
-            return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
+            count = (
+                local_ahead_count
+                if local_ahead_count is not None and "..HEAD" in joined
+                else commit_count
+            )
+            return SimpleNamespace(stdout=f"{count}\n", stderr="", returncode=0)
         if "--ff-only" in joined:
             if ff_only_fails:
                 return SimpleNamespace(
@@ -180,7 +186,11 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
         lambda *a, **kw: restore_calls.append(1) or True,
     )
 
-    side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
+    side_effect, _ = _make_update_side_effect(
+        ff_only_fails=True,
+        reset_fails=True,
+        local_ahead_count=0,
+    )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
