@@ -142,6 +142,55 @@ async def test_status_command_includes_live_agent_model_and_context():
 
 
 @pytest.mark.asyncio
+async def test_status_command_exposes_only_safe_context_engine_observability():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+            get_observability_status=lambda: {
+                "mode": "shadow",
+                "attempted": True,
+                "ok": True,
+                "model": "jev-test",
+                "latency_ms": 12.34567,
+                "candidates": 8,
+                "would_drop_count": 2,
+                "would_reclaim_chars": 1_024,
+                "prompt": "do not render this",
+                "secret": "sk-do-not-render-this",
+                "decisions": [{"content": "do not render this"}],
+            },
+        ),
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert (
+        '**Context engine observability:** '
+        '`{"mode":"shadow","attempted":true,"ok":true,"model":"jev-test",'
+        '"latency_ms":12.346,"candidates":8,"would_drop_count":2,'
+        '"would_reclaim_chars":1024}`'
+    ) in result
+    assert "do not render this" not in result
+    assert "sk-do-not-render-this" not in result
+    assert "decisions" not in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(
@@ -486,5 +535,4 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-
 

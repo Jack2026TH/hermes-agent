@@ -33,8 +33,12 @@ egress, values in sensitive credential fields are replaced, request and response
 bounded, redirects are refused, and the call has a two-second timeout. No
 transcript text or Jev response body is written to the plugin's status metrics.
 
-The metrics include only candidate indices, typed decisions, token usage,
-latency, and the number of characters Jev would have removed. Every call
-returns `None` from `select_context()`, so Hermes keeps using the original
-request. Enabling active pruning requires a separate reviewed change and
-evaluation; it is not part of this plugin's shadow mode.
+The engine keeps candidate indices, typed decisions, and token usage
+internally for local diagnostics, but the gateway status boundary exposes
+only the following content-free fields: `mode`, `attempted`, `ok`, `model`,
+`latency_ms`, `candidates`, `would_drop_count`, and `would_reclaim_chars`.
+Prompt text, tool-result text, credentials, raw provider errors, and the
+internal decision/usage payload never appear in `/status`. Every call returns
+`None` from `select_context()`, so Hermes keeps using the original request.
+Enabling active pruning requires a separate reviewed change and evaluation; it
+is not part of this plugin's shadow mode.

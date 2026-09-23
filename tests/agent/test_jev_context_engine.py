@@ -117,6 +117,28 @@ def test_shadow_selection_preserves_request_and_transcript(monkeypatch):
     assert engine.last_jev_metrics["usage"] == {"input_tokens": 42, "output_tokens": 6}
     assert len(engine.last_jev_metrics["decisions"]) == 2
 
+    observability = engine.get_observability_status()
+    assert list(observability) == [
+        "mode",
+        "attempted",
+        "ok",
+        "model",
+        "latency_ms",
+        "candidates",
+        "would_drop_count",
+        "would_reclaim_chars",
+    ]
+    assert observability["mode"] == "shadow"
+    assert observability["attempted"] is True
+    assert observability["ok"] is True
+    assert observability["model"] == "jev-test"
+    assert observability["candidates"] == 2
+    assert observability["would_drop_count"] == 1
+    assert observability["would_reclaim_chars"] == len(original[3]["content"])
+    assert "usage" not in observability
+    assert "decisions" not in observability
+    assert engine.get_status()["jev"] == observability
+
 
 def test_shadow_engine_keeps_the_normal_compressor():
     engine = JevContextEngine(client=JevClient(token="test-token"))

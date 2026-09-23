@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -67,6 +68,25 @@ def _int_value(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _safe_context_engine_observability(context_engine: Any) -> dict[str, Any]:
+    """Read the generic content-free context-engine status contract.
+
+    The second sanitization pass is intentional: plugins are not trusted to
+    keep arbitrary status payloads free of prompts, transcript text, or
+    secrets. Engines without the optional hook remain completely silent.
+    """
+    getter = getattr(context_engine, "get_observability_status", None)
+    if not callable(getter):
+        return {}
+    try:
+        from agent.context_engine import sanitize_context_engine_observability
+
+        return sanitize_context_engine_observability(getter())
+    except Exception:
+        logger.debug("Context-engine observability status unavailable", exc_info=True)
+        return {}
 
 
 def _model_switch_skew_guard() -> Optional[str]:
@@ -617,6 +637,7 @@ class GatewaySlashCommandsMixin:
         base_url = ""
         context_used = 0
         context_total = 0
+        context_engine_observability: dict[str, Any] = {}
         if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
             model_name = _clean_str(getattr(status_agent, "model", ""))
             provider_name = _clean_str(getattr(status_agent, "provider", ""))
@@ -625,6 +646,7 @@ class GatewaySlashCommandsMixin:
             if ctx is not None:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
                 context_total = _int_value(getattr(ctx, "context_length", 0))
+                context_engine_observability = _safe_context_engine_observability(ctx)
 
         model_name = model_name or _clean_str(session_row.get("model"))
         provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
@@ -683,6 +705,17 @@ class GatewaySlashCommandsMixin:
             lines.append(model_line)
         if context_line:
             lines.append(context_line)
+        if context_engine_observability:
+            lines.append(
+                t(
+                    "gateway.status.context_engine_observability",
+                    status=json.dumps(
+                        context_engine_observability,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),

@@ -4,7 +4,7 @@ import json
 import pytest
 from typing import Any, Dict, List
 
-from agent.context_engine import ContextEngine
+from agent.context_engine import ContextEngine, sanitize_context_engine_observability
 from agent.context_compressor import ContextCompressor
 
 
@@ -103,6 +103,21 @@ class TestDefaults:
         assert status["context_length"] == 200000
         assert status["threshold_tokens"] == 100000
         assert 0 < status["usage_percent"] <= 100
+
+    def test_default_get_observability_status_is_silent(self):
+        engine = StubEngine()
+        assert engine.get_observability_status() == {}
+
+    def test_observability_drops_credential_like_model_identifier(self):
+        safe = sanitize_context_engine_observability(
+            {
+                "mode": "shadow",
+                "attempted": True,
+                "ok": True,
+                "model": "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+            }
+        )
+        assert "model" not in safe
 
 
     def test_on_session_reset(self):
