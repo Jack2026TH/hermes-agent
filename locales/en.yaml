@@ -335,7 +335,6 @@ gateway:
     model_provider:        "**Model:** `{model}` ({provider})"
     context:               "**Context:** {used} / {total} ({pct}%)"
     context_used:          "**Context:** ~{used} tokens"
-    context_engine_observability: "**Context engine observability:** `{status}`"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Agent Running:** {state}"
     state_yes:             "Yes ⚡"
