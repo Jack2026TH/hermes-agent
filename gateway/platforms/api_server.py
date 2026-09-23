@@ -2598,6 +2598,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        tool_mode: str = "platform",
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2865,7 +2866,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            []
+            if tool_mode == "none"
+            else sorted(_get_platform_tools(user_config, "api_server"))
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -6418,6 +6423,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
+        tool_mode = body.get("tool_mode", "platform")
+        if tool_mode not in {"platform", "none"}:
+            return web.json_response(
+                _openai_error("'tool_mode' must be 'platform' or 'none'"),
+                status=400,
+            )
         previous_response_id = body.get("previous_response_id")
 
         # Accept explicit conversation_history from the request body.
@@ -6554,6 +6565,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        tool_mode=tool_mode,
                     )
                 self._active_run_agents[run_id] = agent
 
