@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
 import dataclasses
+from copy import deepcopy
 import json
 import os
 import re
@@ -222,11 +223,27 @@ class GatewayInboundMixin:
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            event._gateway_disposition = "failed"
             self._queue_startup_restore_event(event)
             return None
 
         if is_internal:
             return event, source, True
+
+        disposition_owner = event
+        # Capture transport-owned content before a pre-auth plugin can rewrite it.
+        # Only an installed consumer needs a snapshot; ordinary dispatch keeps its existing path.
+        try:
+            from hermes_cli.lifecycle import has_hook
+            # Native controls and replies to in-flight work remain owned by the gateway.
+            original_event = (
+                deepcopy(event)
+                if not self._hm_estop_turn_allowed(event, source) and has_hook("post_gateway_auth")
+                else None
+            )
+        except Exception:
+            logger.warning("Unable to prepare post_gateway_auth consumer", exc_info=True)
+            return None
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
@@ -260,6 +277,27 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
+        if original_event is not None and not self._hm_estop_turn_allowed(event, source):
+            # pre_gateway_dispatch may rewrite text, but cannot change the identity authorized
+            # for an exclusive source consumer. The consumer receives the original text/media.
+            if original_event.source != source:
+                logger.warning("post_gateway_auth source changed before authorization")
+                return None
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+                results = invoke_hook("post_gateway_auth", event=original_event)
+                for result in results:
+                    if not isinstance(result, dict) or result.get("action") not in {"allow", "handled", "block"}:
+                        raise ValueError("invalid post_gateway_auth result")
+                    if result["action"] in {"handled", "block"}:
+                        disposition_owner._gateway_disposition = ("consumer_handled" if result["action"] == "handled" else "rejected")
+                        return None
+            except Exception:
+                disposition_owner._gateway_disposition = "failed"
+                logger.warning("post_gateway_auth consumer failed; dispatch blocked", exc_info=True)
+                return None
+        # Admission alone does not transfer durable custody to running work.
+        disposition_owner._gateway_disposition = "failed"
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
@@ -1271,6 +1309,21 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        if getattr(event, "internal", False) or not has_hook("gateway_message_disposition"):
+            return await self._handle_message_inner(event)
+        original = deepcopy(event)
+        event._gateway_disposition = "rejected"
+        try:
+            result = await self._handle_message_inner(event)
+        except BaseException:
+            invoke_hook("gateway_message_disposition", event=original, disposition="failed")
+            raise
+        invoke_hook("gateway_message_disposition", event=original,
+                    disposition=event._gateway_disposition)
+        return result
+
+    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -1294,6 +1347,7 @@ class GatewayInboundMixin:
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
+            event._gateway_disposition = "handled"
             return _reply
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
@@ -1301,10 +1355,14 @@ class GatewayInboundMixin:
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
+            result = await self._hm_handle_running_session_message(event, source, _quick_key)
+            if event.get_command() in {"stop", "approve", "deny"}:
+                event._gateway_disposition = "handled"
+            return result
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            event._gateway_disposition = "handled"
             return _result
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a

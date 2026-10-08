@@ -203,7 +203,10 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        callbacks = self._hooks.get(hook_name, [])
+        if hook_name in {"post_gateway_auth", "gateway_message_disposition", "telegram_get_updates_request"} and len(callbacks) > 1:
+            raise RuntimeError("post_gateway_auth requires one consumer per profile")
+        for cb in callbacks:
             try:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
@@ -217,6 +220,8 @@ class PluginDispatchMixin:
                     results.append(ret)
             except Exception as exc:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
+                if hook_name in {"post_gateway_auth", "gateway_message_disposition", "telegram_get_updates_request"}:
+                    raise
         return results
 
     def _report_hook_failure(

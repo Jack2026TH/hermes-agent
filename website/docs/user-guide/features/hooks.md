@@ -463,6 +463,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
+| `post_gateway_auth` | Exclusive consumer | Original non-internal event after user authorization and bot admission; one consumer per served profile. Errors block dispatch. | `event` | Original user text/media and routing snapshot; no send authorization. Python only. |
 | `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
@@ -1193,6 +1194,31 @@ With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `su
 :::
 
 ---
+
+### `post_gateway_auth`
+
+A Python plugin can register one exclusive source consumer per served profile.
+It receives an original `MessageEvent` snapshot captured before
+`pre_gateway_dispatch` rewrites, after profile routing, user authorization and
+bot admission. Internal events, recognized native commands and replies owned
+by in-flight gateway work bypass it; they still pass the existing authorization
+gate. A consumer cannot intercept native stop/approval controls. A pre-auth source identity change
+blocks the consumer.
+
+Return `None` or `{"action": "allow"}` to continue normal dispatch.
+Return `{"action": "handled"}` after the consumer confirms its own durable receipt,
+or `{"action": "block"}` to suppress normal dispatch. Neither result returns a
+reply to the adapter. Exceptions, multiple registered owners and malformed
+results fail closed. The callback runs synchronously to completion: abandoning
+a storage writer on a timeout could let it commit after the gateway continued.
+
+The hook is an application handoff boundary, not a Telegram polling-offset or
+delivery guarantee. User authorization here does not establish a Control Plane
+principal or approve sending. A consumer must independently bind the original
+receiver, actor, chat and update, preserve original bytes and use its existing
+durable idempotent execution path. Telegram's polling queue needs durable
+custody before its polling offset advances; a post-auth hook alone cannot
+provide that custody. This hook is unavailable to shell hooks.
 
 ### `pre_gateway_dispatch`
 
@@ -2005,3 +2031,13 @@ Because `delivery_id` and `timestamp` live **inside the signed body**, a verifie
 - **No consent prompt.** Outbound targets execute no code on your machine — they receive data at a URL you configured. `HERMES_SAFE_MODE=1` still skips registration, same as plugins and shell hooks. Note that payloads include tool inputs and event metadata, so only point targets at endpoints you trust, and prefer `https://`.
 
 `hermes hooks list` shows configured outbound targets alongside shell hooks, including whether each target is signed.
+
+### gateway_message_disposition
+
+Exclusive synchronous Python hook for transport custody owners. Receives an original event snapshot and `disposition` after the actual message handler returns: `handled`, `consumer_handled`, or `rejected`. Admission/handler failure and deferred startup restoration report `failed`; custody owners must retain originals for replay. Exceptions propagate and block transport confirmation. This is an admission/routing checkpoint, not business completion or reply approval. Only one owner per profile may register it; shell hooks are unsupported.
+
+### telegram_get_updates_request
+
+Exclusive synchronous Python hook before Telegram Application construction. Receives the existing configured and instrumented `BaseRequest` as `request`; returns exactly one `{"request": wrapped_request}` result whose request is a `BaseRequest`. A configured owner returning no result, raising, or returning an invalid request fails connection. Shell hooks are unsupported.
+
+A durable request declares `durable_custody = True` and exposes `custody_queue`. That queue must be the same real asyncio queue used by both Application and Updater, and declare durable custody. Validation runs on initial construction and initialization rebuilds. Durable queues preserve pending updates during polling and webhook recovery; ordinary queues retain existing behavior. This hook enables original response capture before SDK normalization, without another poller. Transport custody does not approve a reply.

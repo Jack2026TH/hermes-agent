@@ -3842,6 +3842,14 @@ class BasePlatformAdapter(ABC):
         # races with the running task (split-brain, see PR #4926).
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
+        from hermes_cli.lifecycle import has_hook
+        if (event.source.platform == Platform.TELEGRAM
+                and event.platform_update_id is not None
+                and has_hook("gateway_message_disposition")):
+            # Custody owners require the wrapped gateway path; adapter busy queues
+            # and callbacks are volatile and cannot acknowledge the raw Update.
+            await self._dispatch_inline_reply(event)
+            return
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):
