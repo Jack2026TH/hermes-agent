@@ -3846,8 +3846,11 @@ class BasePlatformAdapter(ABC):
         if (event.source.platform == Platform.TELEGRAM
                 and event.platform_update_id is not None
                 and has_hook("gateway_message_disposition")):
-            # Custody owners require the wrapped gateway path; adapter busy queues
-            # and callbacks are volatile and cannot acknowledge the raw Update.
+            # Preserve the wrapper's post-auth disposition even while busy.
+            # The runner must NOT start another agent before the first turn's
+            # sentinel exists: the adapter guard is already active at entry.
+            # Unhandled follow-ups remain with the durable consumer for replay.
+            event._gateway_adapter_custody_busy = True
             await self._dispatch_inline_reply(event)
             return
         cmd = event.get_command()

@@ -61,3 +61,117 @@ def test_actual_active_adapter_routes_custody_owner_through_wrapped_gateway(monk
     asyncio.run(BasePlatformAdapter._handle_message_while_active(value, message, "synthetic"))
     value._dispatch_inline_reply.assert_awaited_once_with(message)
     value._busy_session_handler.assert_not_awaited()
+
+
+def _custody_test_runner(monkeypatch, *, outcome=None):
+    """Exercise the real terminal handler path without any network or writes."""
+    value = object.__new__(GatewayRunner)
+    value.config = SimpleNamespace(multiplex_profiles=False)
+    value._hm_estop_gate = lambda *args: None
+    value._session_key_for_source = lambda source: "telegram:synthetic"
+    def admit(event):
+        event._gateway_disposition = "failed"
+        return (event, event.source, False)
+    value._hm_admit_event = AsyncMock(side_effect=admit)
+    value._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    value._hm_evict_idle_stale_agent = lambda key: None
+    value._is_session_running = lambda key: False
+    value._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    value._is_telegram_topic_root_lobby = lambda source: False
+    value._external_drain_active = False
+    value._claim_active_session_slot = lambda key, source: (None, None)
+    value._hm_rescue_orphaned_fifo = lambda event, source, internal, key: (event, source, internal)
+    value._session_state = lambda key: SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=0))
+    value._persist_active_agents = lambda: None
+    value._begin_session_run_generation = lambda key: 1
+    value._handle_message_with_agent = AsyncMock(return_value=outcome)
+    value._run_post_turn_hooks = AsyncMock()
+    value._restore_pending_one_turn_model_override = lambda *args: None
+    value._clear_durable_active_turn = AsyncMock()
+    value._release_running_agent_state = lambda *args, **kwargs: None
+    value._release_turn_lease = lambda *args, **kwargs: None
+    manager = plugins.PluginManager()
+    dispositions = []
+    manager._hooks["gateway_message_disposition"] = [
+        lambda event, disposition, **kwargs: dispositions.append(disposition)
+    ]
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+    return value, dispositions
+
+
+@pytest.mark.parametrize("outcome", [None, "finished answer"])
+def test_completed_agent_turn_has_terminal_handled_disposition(monkeypatch, outcome):
+    """Even an empty/streamed reply ran tools: replay would run them twice."""
+    runner, dispositions = _custody_test_runner(monkeypatch, outcome=outcome)
+    event = MessageEvent(text="do work", message_id="7", platform_update_id=8,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="101", chat_id="101", chat_type="group"))
+    assert asyncio.run(runner._handle_message(event)) == outcome
+    assert runner._handle_message_with_agent.await_count == 1
+    assert dispositions == ["handled"]
+
+
+@pytest.mark.parametrize("text", ["new task", "unknown slash /command"])
+def test_busy_adapter_guard_prevents_pre_sentinel_agent_overlap(monkeypatch, text):
+    """Adapter's busy guard is authoritative even before runner agent sentinel."""
+    runner, dispositions = _custody_test_runner(monkeypatch)
+    claims = []
+    runner._claim_active_session_slot = lambda *args: claims.append(args) or (None, None)
+    event = MessageEvent(text=text, message_id="8", platform_update_id=9,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="101", chat_id="101", chat_type="group"))
+    event._gateway_adapter_custody_busy = True
+    assert asyncio.run(runner._handle_message(event)) is None
+    assert dispositions == ["failed"]  # durable owner retains it for retry
+    assert not claims
+    runner._handle_message_with_agent.assert_not_awaited()
+    runner._hm_dispatch_idle_commands.assert_not_awaited()
+
+
+def test_busy_adapter_guard_still_allows_native_command(monkeypatch):
+    runner, dispositions = _custody_test_runner(monkeypatch)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(True, "native response"))
+    event = MessageEvent(text="/status", message_id="9", platform_update_id=10,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="101", chat_id="101", chat_type="group"))
+    event._gateway_adapter_custody_busy = True
+    assert asyncio.run(runner._handle_message(event)) == "native response"
+    assert dispositions == ["handled"]
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_pre_auth_text_rewrite_preserves_terminal_custody_and_busy_guard(monkeypatch, busy):
+    """dataclasses.replace must not strip transport custody metadata or lose ack."""
+    runner, dispositions = _custody_test_runner(monkeypatch, outcome="finished")
+    runner._hm_admit_event = GatewayRunner._hm_admit_event.__get__(runner)
+    runner._hm_estop_turn_allowed = lambda *args: False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized_for_source = lambda source: source.user_id == "101"
+    runner._admit_bot_message_for_source = lambda source: True
+    manager = plugins._delivery_manager()
+    manager._hooks["pre_gateway_dispatch"] = [
+        lambda **kwargs: {"action": "rewrite", "text": "rewritten"}
+    ]
+    event = MessageEvent(text="original", message_id="10", platform_update_id=11,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="101", chat_id="101", chat_type="group"))
+    if busy:
+        event._gateway_adapter_custody_busy = True
+    output = asyncio.run(runner._handle_message(event))
+    if busy:
+        assert output is None
+        assert dispositions == ["failed"]
+        runner._handle_message_with_agent.assert_not_awaited()
+    else:
+        assert output == "finished"
+        assert dispositions == ["handled"]
+        passed_event = runner._handle_message_with_agent.await_args.args[0]
+        assert passed_event.text == "rewritten"
+
+
+def test_completed_turn_not_replayed_on_cleanup_failure(monkeypatch):
+    runner, dispositions = _custody_test_runner(monkeypatch, outcome="finished")
+    runner._clear_durable_active_turn = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+    event = MessageEvent(text="run once", message_id="12", platform_update_id=13,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="101", chat_id="101", chat_type="group"))
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        asyncio.run(runner._handle_message(event))
+    assert runner._handle_message_with_agent.await_count == 1
+    assert dispositions == ["handled"]
