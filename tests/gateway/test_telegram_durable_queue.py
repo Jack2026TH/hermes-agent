@@ -82,3 +82,8 @@ def test_queue_validation_accepts_legacy_app_only_without_durable_claim():
 
     owner_request = SimpleNamespace(durable_custody=True, custody_queue=queue)
     TelegramAdapter._validate_request_custody(app, owner_request)
+
+    # Incomplete SDK updater metadata must fail closed instead of silently proceeding.
+    incomplete_app = SimpleNamespace(update_queue=queue, updater=SimpleNamespace())
+    with pytest.raises(RuntimeError):
+        TelegramAdapter._validate_request_custody(incomplete_app, owner_request)
