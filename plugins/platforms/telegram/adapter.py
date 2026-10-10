@@ -2927,8 +2927,10 @@ class TelegramAdapter(BasePlatformAdapter):
             raise RuntimeError("durable queue requires original polling request capture")
         if getattr(request, "durable_custody", False) is True:
             queue = getattr(request, "custody_queue", None)
-            if (not isinstance(queue, asyncio.Queue) or app.updater is None
-                    or app.update_queue is not queue or app.updater.update_queue is not queue
+            updater = getattr(app, "updater", None)
+            if (not isinstance(queue, asyncio.Queue) or updater is None
+                    or getattr(app, "update_queue", None) is not queue
+                    or getattr(updater, "update_queue", None) is not queue
                     or getattr(queue, "durable_custody", False) is not True):
                 raise RuntimeError("durable request capture requires its shared custody queue")
 
