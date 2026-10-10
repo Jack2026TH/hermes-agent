@@ -3842,6 +3842,17 @@ class BasePlatformAdapter(ABC):
         # races with the running task (split-brain, see PR #4926).
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
+        from hermes_cli.lifecycle import has_hook
+        if (event.source.platform == Platform.TELEGRAM
+                and event.platform_update_id is not None
+                and has_hook("gateway_message_disposition")):
+            # Preserve the wrapper's post-auth disposition even while busy.
+            # The runner must NOT start another agent before the first turn's
+            # sentinel exists: the adapter guard is already active at entry.
+            # Unhandled follow-ups remain with the durable consumer for replay.
+            event._gateway_adapter_custody_busy = True
+            await self._dispatch_inline_reply(event)
+            return
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):

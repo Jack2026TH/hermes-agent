@@ -1712,6 +1712,16 @@ class TelegramAdapter(BasePlatformAdapter):
         request.__class__ = _InstrumentedPollingRequest
         return request
 
+    @staticmethod
+    def _drop_pending_for_app(app, requested: bool) -> bool:
+        """A durable queue owner must retain provider backlog through every recovery path."""
+        queue = getattr(app, "update_queue", None)
+        if getattr(queue, "durable_custody", False) is not True:
+            return requested
+        if not isinstance(queue, asyncio.Queue) or app.updater.update_queue is not queue:
+            raise RuntimeError("durable custody requires one shared PTB update queue")
+        return False
+
     async def _start_polling_once(
         self, app, *, drop_pending_updates: bool, error_callback, abandon_app_on_timeout: bool = False,
         schedule_verifier: bool = True) -> tuple[int, asyncio.Event]:
@@ -1738,7 +1748,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # helper and abandon the partial updater (caller rebuilds).
             await _await_with_thread_deadline(
                 app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES, drop_pending_updates=drop_pending_updates, error_callback=_generation_error_callback),
+                    allowed_updates=Update.ALL_TYPES, drop_pending_updates=self._drop_pending_for_app(app, drop_pending_updates), error_callback=_generation_error_callback),
                 timeout=_UPDATER_START_TIMEOUT,
                 on_abandon=((lambda app=app: _shutdown_abandoned_app(app)) if abandon_app_on_timeout else None))
         finally:
@@ -2895,6 +2905,35 @@ class TelegramAdapter(BasePlatformAdapter):
             request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
         return request, self._instrument_polling_request(get_updates_request)
 
+    @staticmethod
+    def _bind_get_updates_request(request):
+        from hermes_cli.lifecycle import invoke_hook, has_hook
+        from telegram.request import BaseRequest
+        if not has_hook("telegram_get_updates_request"):
+            return request
+        results = invoke_hook("telegram_get_updates_request", request=request)
+        if len(results) != 1 or not isinstance(results[0], dict):
+            raise TypeError("one Telegram polling request owner required")
+        bound = results[0].get("request")
+        if not isinstance(bound, BaseRequest):
+            raise TypeError("Telegram polling request must implement BaseRequest")
+        return bound
+
+    @staticmethod
+    def _validate_request_custody(app, request):
+        queue = getattr(app, "update_queue", None)
+        if (getattr(queue, "durable_custody", False) is True
+                and getattr(request, "durable_custody", False) is not True):
+            raise RuntimeError("durable queue requires original polling request capture")
+        if getattr(request, "durable_custody", False) is True:
+            queue = getattr(request, "custody_queue", None)
+            updater = getattr(app, "updater", None)
+            if (not isinstance(queue, asyncio.Queue) or updater is None
+                    or getattr(app, "update_queue", None) is not queue
+                    or getattr(updater, "update_queue", None) is not queue
+                    or getattr(queue, "durable_custody", False) is not True):
+                raise RuntimeError("durable request capture requires its shared custody queue")
+
     async def _initialize_app_with_retries(self, builder) -> None:
         """``app.initialize()`` with a bounded retry ladder; rebuilds ``self._app``/``self._bot`` from
         ``builder`` after each failed attempt; OSError when the per-attempt or total watchdog expires."""
@@ -2950,6 +2989,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     old_app = self._app
                     self._app = builder.build()
                     self._bot = self._app.bot
+                    self._wire_plugin_handlers(self._app)
+                    self._validate_request_custody(self._app, getattr(self, "_polling_custody_request", None))
                     self._register_handlers(self._app)  # keep core and observer handlers in lockstep
                     with contextlib.suppress(Exception):
                         await _shutdown_abandoned_app(old_app)
@@ -2974,7 +3015,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._app.updater.start_webhook(
             listen=webhook_host, port=webhook_port, url_path=webhook_path, webhook_url=webhook_url,
             secret_token=webhook_secret, allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=not is_reconnect,  # push-based ⇒ practically a no-op; mirrors polling
+            drop_pending_updates=self._drop_pending_for_app(self._app, not is_reconnect),
        )
         self._webhook_mode = True
         self._polling_progress_accepting = False
@@ -3044,11 +3085,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 builder = builder.local_mode(True)
                 logger.info("[%s] Using Telegram local_mode (read files from disk)", self.name)
             request, get_updates_request = await self._build_ptb_requests()
+            get_updates_request = self._bind_get_updates_request(get_updates_request)
+            self._polling_custody_request = get_updates_request
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)
+            self._validate_request_custody(self._app, getattr(self, "_polling_custody_request", None))
             self._register_handlers(self._app)
             await self._initialize_app_with_retries(builder)
             await self._app.start()
