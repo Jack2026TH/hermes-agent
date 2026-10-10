@@ -17,7 +17,8 @@ jobs:
     # Run the full suite on a standard runner available to personal forks.
     # Keep per-file isolation and bound concurrency to the runner capacity.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full per-file suite takes more than 30m on standard 4-core runners.
+    timeout-minutes: 65
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
