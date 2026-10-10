@@ -60,3 +60,25 @@ def test_request_binding_is_strict_and_preserves_existing_request(monkeypatch):
     monkeypatch.setattr(lifecycle, "invoke_hook", lambda *args, **kwargs: [{"request": object()}])
     with pytest.raises(TypeError):
         TelegramAdapter._bind_get_updates_request(original)
+
+
+def test_queue_validation_accepts_legacy_app_only_without_durable_claim():
+    # A legacy test/transport without PTB queue metadata is not a custody owner.
+    legacy_app = SimpleNamespace()
+    plain_request = SimpleNamespace(durable_custody=False)
+    TelegramAdapter._validate_request_custody(legacy_app, plain_request)
+
+    # Declaring durable custody requires the original shared PTB queue.
+    with pytest.raises(RuntimeError):
+        TelegramAdapter._validate_request_custody(
+            legacy_app, SimpleNamespace(durable_custody=True, custody_queue=asyncio.Queue())
+        )
+
+    queue = asyncio.Queue()
+    queue.durable_custody = True
+    app = SimpleNamespace(update_queue=queue, updater=SimpleNamespace(update_queue=queue))
+    with pytest.raises(RuntimeError):
+        TelegramAdapter._validate_request_custody(app, plain_request)
+
+    owner_request = SimpleNamespace(durable_custody=True, custody_queue=queue)
+    TelegramAdapter._validate_request_custody(app, owner_request)
