@@ -2921,7 +2921,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _validate_request_custody(app, request):
-        if (getattr(app.update_queue, "durable_custody", False) is True
+        queue = getattr(app, "update_queue", None)
+        if (getattr(queue, "durable_custody", False) is True
                 and getattr(request, "durable_custody", False) is not True):
             raise RuntimeError("durable queue requires original polling request capture")
         if getattr(request, "durable_custody", False) is True:
