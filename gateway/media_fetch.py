@@ -85,11 +85,18 @@ def fetch_remote_media(path: str) -> Optional[str]:
     if env is None:
         return None
     from gateway.platforms.base import (
-        DOCUMENT_CACHE_DIR, _log_safe_path, _normalize_media_tag_path, validate_media_delivery_path)
+        DOCUMENT_CACHE_DIR, _docker_env_active, _log_safe_path,
+        _normalize_media_tag_path, validate_media_delivery_path)
     from tools.environments.base import FileFetchError
 
     remote_home = getattr(env, "_remote_home", None)
-    candidate = posixpath.normpath(_normalize_media_tag_path(str(path)) or "")
+    spelling = _normalize_media_tag_path(str(path)) or ""
+    docker = _docker_env_active()
+    # Local Docker validation rejects these spellings before Path/normpath can
+    # collapse them. A remote fallback must not undo that rejection.
+    if docker and spelling.startswith("//"):
+        return None
+    candidate = posixpath.normpath(spelling)
     if candidate == "~" or candidate.startswith("~/"):
         if not remote_home:
             return None
@@ -105,7 +112,11 @@ def fetch_remote_media(path: str) -> Optional[str]:
         basename = re.sub(r"[^\w.\-]", "_", posixpath.basename(resolved)) or "file"
         dest = Path(DOCUMENT_CACHE_DIR) / f"remote_{uuid.uuid4().hex[:12]}_{basename}"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        env.fetch_file(resolved, dest, max_bytes=_FETCH_MAX_BYTES)
+        # Docker hard-link aliases must remain denied when the file lives
+        # outside host-visible mounts. Check the actual inode being copied,
+        # before any bytes enter the trusted host cache.
+        kwargs = {"require_single_link": True} if docker else {}
+        env.fetch_file(resolved, dest, max_bytes=_FETCH_MAX_BYTES, **kwargs)
     except FileFetchError as exc:
         logger.warning("Remote media fetch of %s skipped: %s", _log_safe_path(candidate), exc)
         return None
