@@ -1133,6 +1133,16 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
+    if _docker_env_active():
+        # realpath cannot distinguish an artifact from a hard-link alias of
+        # sandbox credentials. Reject shared inodes before any cache/operator
+        # trust: aliases can cross the home, workspace and explicit mounts.
+        # Producers can copy legitimate multiply-linked artifacts to a new file.
+        try:
+            if resolved.stat().st_nlink != 1:
+                return None
+        except OSError:
+            return None
     if _docker_env_active() and _docker_home_secret_target(resolved, session_key):
         return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
