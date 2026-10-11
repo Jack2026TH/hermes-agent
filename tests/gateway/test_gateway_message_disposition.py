@@ -175,3 +175,18 @@ def test_completed_turn_not_replayed_on_cleanup_failure(monkeypatch):
         asyncio.run(runner._handle_message(event))
     assert runner._handle_message_with_agent.await_count == 1
     assert dispositions == ["handled"]
+
+
+def test_pre_tool_exception_keeps_original_in_durable_custody(monkeypatch):
+    """A failure before the agent starts must be retryable, never acknowledged."""
+    runner, dispositions = _custody_test_runner(monkeypatch)
+    runner._hm_pending_reply_intercepts = AsyncMock(
+        side_effect=TimeoutError("synthetic pre-agent failure"))
+    event = MessageEvent(
+        text="do not drop this update", message_id="14", platform_update_id=15,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="101",
+                             chat_id="101", chat_type="group"))
+    with pytest.raises(TimeoutError, match="pre-agent failure"):
+        asyncio.run(runner._handle_message(event))
+    assert dispositions == ["failed"]
+    runner._handle_message_with_agent.assert_not_awaited()
