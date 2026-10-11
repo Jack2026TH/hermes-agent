@@ -95,3 +95,42 @@ def test_fetch_file_round_trips_bytes_and_enforces_the_in_sandbox_size_cap(tmp_p
         env.fetch_file(str(src), dest, max_bytes=100)
     with pytest.raises(FileFetchError, match="could not read"):
         env.fetch_file(str(tmp_path), dest, max_bytes=100)  # a directory is not a regular file
+
+
+@pytest.mark.parametrize("prefix", ["/workspace", "/output", "///workspace"])
+def test_docker_fallback_never_copies_hardlinked_credentials(tmp_path, monkeypatch, prefix):
+    """PR #11: exercise MEDIA filtering through the real shell transfer, not just local validation."""
+    import os
+
+    secret = tmp_path / "home" / ".hermes" / "auth.json"
+    secret.parent.mkdir(parents=True)
+    secret.write_bytes(b"synthetic credential fixture")
+    alias = tmp_path / "remote" / "hard.png"
+    alias.parent.mkdir()
+    os.link(secret, alias)
+    ordinary = alias.with_name("ordinary.png")
+    ordinary.write_bytes(b"ordinary remote artifact")
+
+    class DockerShell(_ScriptedEnv):
+        _remote_home = None
+
+        def fetch_realpath(self, remote_path):
+            return str(alias.parent / Path(remote_path).name)
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
+    monkeypatch.setattr(media_fetch, "_active_remote_env", lambda: DockerShell())
+    cache = tmp_path / "cache" / "documents"
+    monkeypatch.setattr("gateway.platforms.base.DOCUMENT_CACHE_DIR", cache)
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (cache,))
+
+    media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{prefix}/hard.png")
+    assert BasePlatformAdapter.filter_media_delivery_paths(media) == []
+    assert not list(cache.glob("*")), "Credential bytes must never reach the host cache"
+    # Reject ambiguous slash spelling even for an ordinary file; preserve normal Docker fetches.
+    if prefix.startswith("//"):
+        assert media_fetch.fetch_remote_media(prefix + "/ordinary.png") is None
+    delivered = BasePlatformAdapter.filter_media_delivery_paths([("/workspace/ordinary.png", False)])
+    assert len(delivered) == 1
+    assert Path(delivered[0][0]).read_bytes() == ordinary.read_bytes()
