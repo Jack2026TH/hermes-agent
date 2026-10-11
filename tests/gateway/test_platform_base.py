@@ -980,6 +980,15 @@ class TestDockerContainerMediaPathTranslation:
         assert BasePlatformAdapter.validate_media_delivery_path(
             "/root/./.hermes/auth.json"
         ) is None
+        # The in-process terminal bridge may enable Docker *during* translation.
+        # Security checks must run after that bridge, not on stale env state.
+        from tools import terminal_tool
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setattr(terminal_tool, "_ensure_terminal_env_bridged",
+                            lambda: monkeypatch.setenv("TERMINAL_ENV", "docker"))
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/root/.hermes/auth.json"
+        ) is None
 
 
 # ---------------------------------------------------------------------------
