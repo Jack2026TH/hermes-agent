@@ -1086,8 +1086,23 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     if not expanded.is_absolute():
         return None
     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
+    # Translation bridges TERMINAL_* on in-process gateways; determine Docker
+    # policy only AFTER the bridge, otherwise a first-turn secret path can pass.
     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
+    # Docker's /root is a container namespace, NOT the gateway host's home.
+    # Only explicitly mounted artifact caches under /root/.hermes may deliver;
+    # credentials remain denied even through an explicit /root Docker volume.
+    docker_path = Path(os.path.normpath(str(expanded)))
+    if _docker_env_active() and _path_is_within(docker_path, Path("/root/.hermes")):
+        if not any(_path_is_within(docker_path, cache_root)
+                   for _, cache_root in _cache_dir_container_mounts()):
+            return None
     if resolved is None:
+        # Never silently fall through from an unmapped Docker home/workspace
+        # to the host filesystem (which could contain root-owned secrets).
+        if _docker_env_active() and any(_path_is_within(docker_path, root)
+                                        for root in (Path("/root"), Path("/workspace"))):
+            return None
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None

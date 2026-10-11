@@ -958,6 +958,7 @@ class TestDockerContainerMediaPathTranslation:
         surface: .env, auth.json) must NOT resolve through the persistent
         home mount — those host-side copies sit outside the credential
         denylist prefixes and would otherwise deliver."""
+        import json
         sandbox = tmp_path / "sandboxes"
         home = sandbox / "docker" / "default" / "home"
         secret = home / ".hermes"
@@ -971,6 +972,20 @@ class TestDockerContainerMediaPathTranslation:
         monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(sandbox))
         monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
 
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/root/.hermes/auth.json"
+        ) is None
+        # An explicit /root volume must not override the Docker credential deny.
+        monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{home}:/root"]))
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/root/./.hermes/auth.json"
+        ) is None
+        # The in-process terminal bridge may enable Docker *during* translation.
+        # Security checks must run after that bridge, not on stale env state.
+        from tools import terminal_tool
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setattr(terminal_tool, "_ensure_terminal_env_bridged",
+                            lambda: monkeypatch.setenv("TERMINAL_ENV", "docker"))
         assert BasePlatformAdapter.validate_media_delivery_path(
             "/root/.hermes/auth.json"
         ) is None
