@@ -936,6 +936,55 @@ class TestDockerContainerMediaPathTranslation:
             "/root/out.png"
         ) == str(media.resolve())
 
+    @pytest.mark.parametrize("explicit_root_volume", [False, True])
+    def test_root_media_symlink_into_sandbox_credentials_is_rejected(
+            self, tmp_path, monkeypatch, explicit_root_volume):
+        """A /root/out.png symlink must not expose /root/.hermes secrets."""
+        import json
+        home = tmp_path / "sandboxes" / "docker" / "default" / "home"
+        credentials = home / ".hermes"
+        credentials.mkdir(parents=True)
+        (credentials / "auth.json").write_text('{"synthetic": "fixture"}')
+        (credentials / ".env").write_text("synthetic-only\n")
+        (home / "out.png").symlink_to(".hermes/auth.json")
+        (home / "nested").mkdir()
+        (home / "nested" / "copy.png").symlink_to("../.hermes/.env")
+        ordinary = home / "ordinary.png"
+        ordinary.write_bytes(b"safe synthetic file")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+        monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "different-hermes-home"))
+        monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
+        if explicit_root_volume:
+            monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{home}:/root"]))
+        for path in ("/root/out.png", "/root/nested/copy.png"):
+            assert BasePlatformAdapter.validate_media_delivery_path(path) is None
+            media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{path}")
+            assert BasePlatformAdapter.filter_media_delivery_paths(media) == []
+        # The protection must not disable normal Docker-produced artifacts.
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/root/ordinary.png") == str(ordinary.resolve())
+
+    @pytest.mark.parametrize("slashes", ["//", "///"])
+    def test_docker_double_slash_does_not_fallback_to_host(self, tmp_path, monkeypatch, slashes):
+        """POSIX // must not reach the host via Docker MEDIA namespace fallback."""
+        host_file = tmp_path / "host-only.png"
+        host_file.write_bytes(b"synthetic host file")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+        monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
+        # Single leading / may denote an intentionally local host artifact.
+        assert BasePlatformAdapter.validate_media_delivery_path(str(host_file)) == str(host_file.resolve())
+        hostile = slashes + str(host_file).lstrip("/")
+        assert BasePlatformAdapter.validate_media_delivery_path(hostile) is None
+        media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{hostile}")
+        assert BasePlatformAdapter.filter_media_delivery_paths(media) == []
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            slashes + "root/.hermes/auth.json") is None
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            slashes + "workspace/host-only.png") is None
+
     def test_cache_dir_container_path_translates_to_host_cache(self, tmp_path, monkeypatch):
         """MEDIA:/root/.hermes/cache/images/... (the agent_visible_image path
         under docker) must translate to the HOST cache file, not the sandbox
