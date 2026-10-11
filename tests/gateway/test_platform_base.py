@@ -958,6 +958,7 @@ class TestDockerContainerMediaPathTranslation:
         surface: .env, auth.json) must NOT resolve through the persistent
         home mount — those host-side copies sit outside the credential
         denylist prefixes and would otherwise deliver."""
+        import json
         sandbox = tmp_path / "sandboxes"
         home = sandbox / "docker" / "default" / "home"
         secret = home / ".hermes"
@@ -973,6 +974,11 @@ class TestDockerContainerMediaPathTranslation:
 
         assert BasePlatformAdapter.validate_media_delivery_path(
             "/root/.hermes/auth.json"
+        ) is None
+        # An explicit /root volume must not override the Docker credential deny.
+        monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{home}:/root"]))
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/root/./.hermes/auth.json"
         ) is None
 
 
