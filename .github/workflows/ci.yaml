@@ -21,7 +21,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # needed by lint (PR comment) + supply-chain review_status
+  pull-requests: read # classifier and review gate only read PR metadata
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -126,14 +126,7 @@ jobs:
     # Tests-only PRs (~17% of commits) skip this 5-minute job — the longest
     # single job in the workflow — while still running the full pytest lanes.
     #
-    # Re-disabled (Sep 2026): the Sep 1 re-enable is still incredibly flaky.
-    # Keep this a bare `if: false`. The earlier
-    # `${{ false && (... || ...) }}` form on this reusable-workflow job made
-    # GitHub's workflow parser fail at startup ("An unexpected error has
-    # occurred") — every ci.yaml run repo-wide dispatched 0 jobs from
-    # 24f5a60ed1 until this line changed. To re-enable, restore:
-    #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
-    if: false
+    if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
@@ -215,8 +208,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when dependencies fail. Every required lane must succeed;
+  # skipped is accepted only when its change-classifier condition was false.
   #
   # Branch protection should require ONLY this check.
   #
@@ -238,6 +231,7 @@ jobs:
       - history-check
       - contributor-check
       - uv-lockfile
+      - infographic-check
       - case-collision-check
       - lockfile-diff
       - docker-lint
@@ -258,29 +252,36 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Evaluate job results
         id: evaluate
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS" | python3 -c "
-          import json, sys
-          needs = json.load(sys.stdin)
-          # Emit compact {job_name: result} for the comment assembler.
-          compact = {name: info['result'] for name, info in needs.items()}
-          print(f'needs-json={json.dumps(compact)}')
-          with open('$GITHUB_OUTPUT', 'a') as f:
-              f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
-          for name, info in sorted(needs.items()):
-              result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
-              print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
-              sys.exit(1)
-          print('All checks passed (or were skipped)')
-          "
+          REQUIRED: |
+            {
+            "detect": true,
+            "tests": ${{ toJSON(needs.detect.outputs.python == 'true') }},
+            "tests-os": ${{ toJSON(needs.detect.outputs.python == 'true') }},
+            "lint": ${{ toJSON(needs.detect.outputs.python == 'true') }},
+            "js-tests": ${{ toJSON(needs.detect.outputs.frontend == 'true') }},
+            "installer-tests": ${{ toJSON(needs.detect.outputs.installer == 'true') }},
+            "rust-tests": ${{ toJSON(needs.detect.outputs.rust == 'true') }},
+            "e2e-desktop": ${{ toJSON(needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }},
+            "docs-site": ${{ toJSON(needs.detect.outputs.site == 'true') }},
+            "history-check": ${{ toJSON(needs.detect.outputs.event_name == 'pull_request') }},
+            "contributor-check": ${{ toJSON(needs.detect.outputs.python == 'true') }},
+            "uv-lockfile": ${{ toJSON(needs.detect.outputs.uv_lock == 'true') }},
+            "infographic-check": true,
+            "case-collision-check": true,
+            "lockfile-diff": ${{ toJSON(needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true') }},
+            "docker-lint": ${{ toJSON(needs.detect.outputs.docker_meta == 'true') }},
+            "profile-artifact-check": true,
+            "supply-chain": ${{ toJSON(needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')) }},
+            "review-labels": ${{ toJSON(needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')) }}
+            }
+        run: python3 scripts/ci/check_required_jobs.py
 
   # ─────────────────────────────────────────────────────────────────────
   # CI timing report: collect per-job/step durations from the GitHub API,

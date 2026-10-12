@@ -727,6 +727,8 @@ class TestRegisterHandlers:
             lambda scope, identity, metadata=None: (True, None),
         )
         a._register_handlers = MagicMock()
+        # This test verifies registration after retry, not polling request custody.
+        monkeypatch.setattr(a, "_bind_get_updates_request", lambda request: request)
 
         result = asyncio.run(a.connect())
 

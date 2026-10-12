@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
 import dataclasses
+from copy import deepcopy
 import json
 import os
 import re
@@ -222,18 +223,43 @@ class GatewayInboundMixin:
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            event._gateway_disposition = "failed"
             self._queue_startup_restore_event(event)
             return None
 
         if is_internal:
             return event, source, True
 
+        disposition_owner = event
+        # Capture transport-owned content before a pre-auth plugin can rewrite it.
+        # Only an installed consumer needs a snapshot; ordinary dispatch keeps its existing path.
+        try:
+            from hermes_cli.lifecycle import has_hook
+            # Native controls and replies to in-flight work remain owned by the gateway.
+            original_event = (
+                deepcopy(event)
+                if not self._hm_estop_turn_allowed(event, source) and has_hook("post_gateway_auth")
+                else None
+            )
+        except Exception:
+            logger.warning("Unable to prepare post_gateway_auth consumer", exc_info=True)
+            return None
+
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        event = self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
+        dispatched_event = self._hm_pre_gateway_dispatch_hook(event, source)
+        if dispatched_event is None:
             return None
+        if dispatched_event is not disposition_owner:
+            # A pre-dispatch rewrite uses dataclasses.replace and loses
+            # dynamic transport metadata. The outer custody wrapper must
+            # observe the rewritten event's terminal disposition, while its
+            # adapter-busy guard must survive the rewrite to prevent overlap.
+            disposition_owner._gateway_disposition_event = dispatched_event
+            if getattr(disposition_owner, "_gateway_adapter_custody_busy", False):
+                dispatched_event._gateway_adapter_custody_busy = True
+        event = dispatched_event
         source = event.source
 
         if not self._is_user_authorized_for_source(source):
@@ -260,6 +286,27 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
+        if original_event is not None and not self._hm_estop_turn_allowed(event, source):
+            # pre_gateway_dispatch may rewrite text, but cannot change the identity authorized
+            # for an exclusive source consumer. The consumer receives the original text/media.
+            if original_event.source != source:
+                logger.warning("post_gateway_auth source changed before authorization")
+                return None
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+                results = invoke_hook("post_gateway_auth", event=original_event)
+                for result in results:
+                    if not isinstance(result, dict) or result.get("action") not in {"allow", "handled", "block"}:
+                        raise ValueError("invalid post_gateway_auth result")
+                    if result["action"] in {"handled", "block"}:
+                        disposition_owner._gateway_disposition = ("consumer_handled" if result["action"] == "handled" else "rejected")
+                        return None
+            except Exception:
+                disposition_owner._gateway_disposition = "failed"
+                logger.warning("post_gateway_auth consumer failed; dispatch blocked", exc_info=True)
+                return None
+        # Admission alone does not transfer durable custody to running work.
+        disposition_owner._gateway_disposition = "failed"
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
@@ -1271,6 +1318,32 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        if getattr(event, "internal", False) or not has_hook("gateway_message_disposition"):
+            return await self._handle_message_inner(event)
+        original = deepcopy(event)
+        event._gateway_disposition = "rejected"
+        def _terminal_disposition():
+            # pre_gateway_dispatch can replace the event (dataclasses.replace).
+            # Observe that replacement rather than reverting to the original
+            # event's pre-admission "failed" state after a completed turn.
+            effective = getattr(event, "_gateway_disposition_event", event)
+            return getattr(effective, "_gateway_disposition",
+                           getattr(event, "_gateway_disposition", "rejected"))
+        try:
+            result = await self._handle_message_inner(event)
+        except BaseException:
+            # Cleanup after a finished turn may fail independently. Once tools
+            # have executed, replaying the original would repeat their effects.
+            settled = _terminal_disposition()
+            invoke_hook("gateway_message_disposition", event=original,
+                        disposition="handled" if settled == "handled" else "failed")
+            raise
+        invoke_hook("gateway_message_disposition", event=original,
+                    disposition=_terminal_disposition())
+        return result
+
+    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -1289,29 +1362,52 @@ class GatewayInboundMixin:
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
+            event._gateway_disposition = "rejected"
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
+            event._gateway_disposition = "handled"
             return _reply
+
+        # The adapter installs its active-session guard BEFORE the runner has
+        # installed an agent sentinel. A concurrent Telegram update must not
+        # fall through that gap and start a second agent. Only native commands
+        # can bypass the busy adapter guard; other events stay in the durable
+        # consumer's custody (failed => retry after the active turn).
+        if getattr(event, "_gateway_adapter_custody_busy", False):
+            from hermes_cli.commands import should_bypass_active_session
+            if not should_bypass_active_session(event.get_command()):
+                return None
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
+            result = await self._hm_handle_running_session_message(event, source, _quick_key)
+            from hermes_cli.commands import should_bypass_active_session
+            if should_bypass_active_session(event.get_command()):
+                event._gateway_disposition = "handled"
+            return result
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            event._gateway_disposition = "handled"
             return _result
+        if getattr(event, "_gateway_adapter_custody_busy", False):
+            # A recognized slash may rewrite into a normal agent request.
+            # Do not start that request while the adapter still owns the
+            # previous session; its durable original is available for retry.
+            return None
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.
         if not is_internal:
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
                 # Debounced so a user who forgets about topic mode doesn't get ten reminders.
+                event._gateway_disposition = "rejected"
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
@@ -1319,6 +1415,7 @@ class GatewayInboundMixin:
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.
             if self._external_drain_active:
+                event._gateway_disposition = "rejected"
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return (
                     "⏳ This agent is draining for a maintenance action and isn't "
@@ -1331,6 +1428,7 @@ class GatewayInboundMixin:
         # passes the "already running" guard and spins up a duplicate agent for the same session.
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
+            event._gateway_disposition = "rejected"
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             return _limit_message
 
@@ -1348,6 +1446,7 @@ class GatewayInboundMixin:
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
+                event._gateway_disposition = "rejected"
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
                 logger.error(
@@ -1367,6 +1466,11 @@ class GatewayInboundMixin:
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
+            # The agent turn finished: replaying this update would repeat its
+            # terminal/file/message tool effects, even when the final reply is
+            # empty or streamed separately. Retain "failed" only for incomplete
+            # or rejected turns, never a completed run.
+            event._gateway_disposition = "handled"
             return _agent_result
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,

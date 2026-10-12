@@ -197,7 +197,8 @@ class BaseEnvironment(ABC):
         ...
 
     # --- File extraction (backend -> host) ---
-    def fetch_file(self, remote_path: str, local_dest: Path, *, max_bytes: int) -> None:
+    def fetch_file(self, remote_path: str, local_dest: Path, *, max_bytes: int,
+                   require_single_link: bool = False) -> None:
         """Copy a regular file out of the backend filesystem to ``local_dest`` on the host.
 
         One transport for every backend: base64 over the exec channel, bounded INSIDE the sandbox
@@ -205,6 +206,8 @@ class BaseEnvironment(ABC):
         shape ``tools.image_source`` uses to read sandbox images). The payload is fenced between
         unique markers so login-shell noise in the merged stdout/stderr can't corrupt the decode.
         Raises :class:`FileFetchError` on a missing/unreadable/oversized file.
+        ``require_single_link`` is the Linux Docker media guard: pin a file
+        descriptor, reject shared inodes, and read that same descriptor.
         """
         import base64
         import binascii
@@ -212,9 +215,25 @@ class BaseEnvironment(ABC):
         quoted = shlex.quote(remote_path)
         # ``[ -f ]`` follows symlinks, so a link to a denied host file is judged by the CALLER on
         # ``readlink -f`` output before any bytes move.
-        result = self.execute(
-            f"[ -f {quoted} ] && echo {marker} && head -c {max_bytes + 1} < {quoted} | base64 && echo {marker}",
-            timeout=_FETCH_TIMEOUT_SECONDS, rewrite_compound_background=False)
+        guard = f"[ -f {quoted} ]"
+        read_from = f"< {quoted}"
+        if require_single_link:
+            guard += (f" && exec 3< {quoted} && [ -f /proc/self/fd/3 ]"
+                      ' && [ "$(command -p stat -Lc %h /proc/self/fd/3)" = 1 ]')
+            read_from = "<&3"
+        utility = "command -p " if require_single_link else ""
+        transfer = (f"{guard} && echo {marker} && {utility}head -c {max_bytes + 1} "
+                    f"{read_from} | {utility}base64 && echo {marker}")
+        if require_single_link:
+            # This guard is a security decision, not an agent terminal command.
+            # execute() sources agent-controlled PATH/functions/aliases from the
+            # session snapshot, which can forge stat's link count. Run directly
+            # in a non-login backend shell and resolve utilities via default PATH.
+            proc = self._run_bash(transfer, login=False, timeout=_FETCH_TIMEOUT_SECONDS)
+            result = self._wait_for_process(proc, timeout=_FETCH_TIMEOUT_SECONDS)
+        else:
+            result = self.execute(transfer, timeout=_FETCH_TIMEOUT_SECONDS,
+                                  rewrite_compound_background=False)
         output = result.get("output") or ""
         first, last = output.find(marker), output.rfind(marker)
         if int(result.get("returncode") or 0) != 0 or first == -1 or last <= first:

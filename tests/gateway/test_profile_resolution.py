@@ -392,7 +392,7 @@ class TestAdapterToSessionKeyIntegration:
         roundtrip = SessionSource.from_dict(source.to_dict())
         assert roundtrip.profile_route_rejected is False
         assert roundtrip == source
-        result = await GatewayRunner._handle_message(
+        result = await GatewayRunner._handle_message_inner(
             mock_runner,
             MessageEvent(text="discard me", source=source),
         )
@@ -415,7 +415,7 @@ class TestAdapterToSessionKeyIntegration:
             "hermes_cli.profiles.profiles_to_serve",
             return_value=[("default", Path("/profiles/default"))],
         ):
-            result = await GatewayRunner._handle_message(
+            result = await GatewayRunner._handle_message_inner(
                 mock_runner,
                 MessageEvent(text="discard me", source=source),
             )

@@ -81,6 +81,55 @@ class _ScriptedEnv(BaseEnvironment):
         proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
         return {"output": "echo login-noise\n" + proc.stdout + proc.stderr, "returncode": proc.returncode}
 
+    def _run_bash(self, command, *, login=False, timeout=120, stdin_data=None):
+        import subprocess
+        assert not login
+        return subprocess.Popen(["bash", "-c", command], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+
+
+@pytest.mark.parametrize("poison", ["function", "alias", "path"])
+def test_single_link_fetch_ignores_agent_shell_snapshot(tmp_path, poison):
+    """The real execute wrapper must not let session shell state forge stat nlink."""
+    import os
+    import shlex
+
+    secret = tmp_path / "synthetic-secret"
+    secret.write_bytes(b"synthetic credential fixture")
+    alias = tmp_path / "artifact.png"
+    os.link(secret, alias)
+    dest = tmp_path / "copy.png"
+
+    class SnapshotShell(_ScriptedEnv):
+        def __init__(self):
+            BaseEnvironment.__init__(self, str(tmp_path), 5)
+            self._snapshot_path = str(tmp_path / "snapshot.sh")
+            self._cwd_file = str(tmp_path / "cwd.txt")
+            self._snapshot_ready = True
+
+        execute = BaseEnvironment.execute
+
+    env = SnapshotShell()
+    if poison == "function":
+        snapshot = "stat() { echo 1; }\n"
+    elif poison == "alias":
+        snapshot = "shopt -s expand_aliases\nalias stat='echo 1 #'\n"
+    else:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "stat"
+        fake.write_text("#!/bin/sh\necho 1\n", encoding="utf-8")
+        fake.chmod(0o755)
+        snapshot = "export PATH=" + shlex.quote(str(bin_dir)) + ":$PATH\n"
+    Path(env._snapshot_path).write_text(snapshot, encoding="utf-8")
+    with pytest.raises(FileFetchError):
+        env.fetch_file(str(alias), dest, max_bytes=100, require_single_link=True)
+    assert not dest.exists(), "Hard-linked bytes must not reach the delivery cache"
+    ordinary = tmp_path / "ordinary.png"
+    ordinary.write_bytes(b"ordinary artifact")
+    env.fetch_file(str(ordinary), dest, max_bytes=100, require_single_link=True)
+    assert dest.read_bytes() == ordinary.read_bytes()
+
 
 def test_fetch_file_round_trips_bytes_and_enforces_the_in_sandbox_size_cap(tmp_path):
     src = tmp_path / "artifact.bin"
@@ -95,3 +144,42 @@ def test_fetch_file_round_trips_bytes_and_enforces_the_in_sandbox_size_cap(tmp_p
         env.fetch_file(str(src), dest, max_bytes=100)
     with pytest.raises(FileFetchError, match="could not read"):
         env.fetch_file(str(tmp_path), dest, max_bytes=100)  # a directory is not a regular file
+
+
+@pytest.mark.parametrize("prefix", ["/workspace", "/output", "///workspace"])
+def test_docker_fallback_never_copies_hardlinked_credentials(tmp_path, monkeypatch, prefix):
+    """PR #11: exercise MEDIA filtering through the real shell transfer, not just local validation."""
+    import os
+
+    secret = tmp_path / "home" / ".hermes" / "auth.json"
+    secret.parent.mkdir(parents=True)
+    secret.write_bytes(b"synthetic credential fixture")
+    alias = tmp_path / "remote" / "hard.png"
+    alias.parent.mkdir()
+    os.link(secret, alias)
+    ordinary = alias.with_name("ordinary.png")
+    ordinary.write_bytes(b"ordinary remote artifact")
+
+    class DockerShell(_ScriptedEnv):
+        _remote_home = None
+
+        def fetch_realpath(self, remote_path):
+            return str(alias.parent / Path(remote_path).name)
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
+    monkeypatch.setattr(media_fetch, "_active_remote_env", lambda: DockerShell())
+    cache = tmp_path / "cache" / "documents"
+    monkeypatch.setattr("gateway.platforms.base.DOCUMENT_CACHE_DIR", cache)
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (cache,))
+
+    media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{prefix}/hard.png")
+    assert BasePlatformAdapter.filter_media_delivery_paths(media) == []
+    assert not list(cache.glob("*")), "Credential bytes must never reach the host cache"
+    # Reject ambiguous slash spelling even for an ordinary file; preserve normal Docker fetches.
+    if prefix.startswith("//"):
+        assert media_fetch.fetch_remote_media(prefix + "/ordinary.png") is None
+    delivered = BasePlatformAdapter.filter_media_delivery_paths([("/workspace/ordinary.png", False)])
+    assert len(delivered) == 1
+    assert Path(delivered[0][0]).read_bytes() == ordinary.read_bytes()

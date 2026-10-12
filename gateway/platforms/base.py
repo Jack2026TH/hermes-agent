@@ -1069,6 +1069,28 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     return None
 
 
+def _docker_home_secret_target(resolved: Path, session_key: str) -> bool:
+    """Deny real sandbox-home secrets even when MEDIA uses a symlink alias.
+
+    The host Hermes denylist does not cover Docker's separately mounted
+    ``<sandbox>/docker/<profile>/home/.hermes``.  Inspect the *resolved* host
+    target of the mount, not only the model's lexical ``/root/out.png`` path.
+    Explicit ``TERMINAL_DOCKER_VOLUMES`` mounts of ``/root`` need the same rule.
+    Dedicated cache mounts remain independently deliverable as before.
+    """
+    roots = _docker_persistent_sandbox_roots(session_key, "home")
+    roots.extend(host for host, container in _parse_docker_volume_mounts()
+                 if container == Path("/root"))
+    for home in roots:
+        if not _path_is_within(resolved, home):
+            continue
+        for relative in (".hermes", *_MEDIA_DELIVERY_DENIED_HOME_SUBPATHS):
+            blocked_root = _resolve_path(home / relative)
+            if blocked_root is not None and _path_is_within(resolved, blocked_root):
+                return True
+    return False
+
+
 def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
     """Safe absolute file path for native media delivery, else None. Default: any existing
     regular file outside the credential / system denylist (symmetric with inbound). Strict
@@ -1086,10 +1108,42 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     if not expanded.is_absolute():
         return None
     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
+    # Translation bridges TERMINAL_* on in-process gateways; determine Docker
+    # policy only AFTER the bridge, otherwise a first-turn secret path can pass.
     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
+    # Preserve the original spelling: POSIX normpath deliberately keeps a
+    # leading '//', while Path() can collapse '///'. Reject ambiguous leading
+    # slashes in Docker mode before any host-file fallback.
+    if _docker_env_active() and candidate.startswith("//"):
+        return None
+    # Docker's /root is a container namespace, NOT the gateway host's home.
+    # Only explicitly mounted artifact caches under /root/.hermes may deliver;
+    # credentials remain denied even through an explicit /root Docker volume.
+    docker_path = Path(os.path.normpath(str(expanded)))
+    if _docker_env_active() and _path_is_within(docker_path, Path("/root/.hermes")):
+        if not any(_path_is_within(docker_path, cache_root)
+                   for _, cache_root in _cache_dir_container_mounts()):
+            return None
     if resolved is None:
+        # Never silently fall through from an unmapped Docker home/workspace
+        # to the host filesystem (which could contain root-owned secrets).
+        if _docker_env_active() and any(_path_is_within(docker_path, root)
+                                        for root in (Path("/root"), Path("/workspace"))):
+            return None
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
+        return None
+    if _docker_env_active():
+        # realpath cannot distinguish an artifact from a hard-link alias of
+        # sandbox credentials. Reject shared inodes before any cache/operator
+        # trust: aliases can cross the home, workspace and explicit mounts.
+        # Producers can copy legitimate multiply-linked artifacts to a new file.
+        try:
+            if resolved.stat().st_nlink != 1:
+                return None
+        except OSError:
+            return None
+    if _docker_env_active() and _docker_home_secret_target(resolved, session_key):
         return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():
@@ -3842,6 +3896,17 @@ class BasePlatformAdapter(ABC):
         # races with the running task (split-brain, see PR #4926).
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
+        from hermes_cli.lifecycle import has_hook
+        if (event.source.platform == Platform.TELEGRAM
+                and event.platform_update_id is not None
+                and has_hook("gateway_message_disposition")):
+            # Preserve the wrapper's post-auth disposition even while busy.
+            # The runner must NOT start another agent before the first turn's
+            # sentinel exists: the adapter guard is already active at entry.
+            # Unhandled follow-ups remain with the durable consumer for replay.
+            event._gateway_adapter_custody_busy = True
+            await self._dispatch_inline_reply(event)
+            return
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):
