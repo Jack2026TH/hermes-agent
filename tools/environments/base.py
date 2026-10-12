@@ -219,11 +219,21 @@ class BaseEnvironment(ABC):
         read_from = f"< {quoted}"
         if require_single_link:
             guard += (f" && exec 3< {quoted} && [ -f /proc/self/fd/3 ]"
-                      ' && [ "$(stat -Lc %h /proc/self/fd/3)" = 1 ]')
+                      ' && [ "$(command -p stat -Lc %h /proc/self/fd/3)" = 1 ]')
             read_from = "<&3"
-        result = self.execute(
-            f"{guard} && echo {marker} && head -c {max_bytes + 1} {read_from} | base64 && echo {marker}",
-            timeout=_FETCH_TIMEOUT_SECONDS, rewrite_compound_background=False)
+        utility = "command -p " if require_single_link else ""
+        transfer = (f"{guard} && echo {marker} && {utility}head -c {max_bytes + 1} "
+                    f"{read_from} | {utility}base64 && echo {marker}")
+        if require_single_link:
+            # This guard is a security decision, not an agent terminal command.
+            # execute() sources agent-controlled PATH/functions/aliases from the
+            # session snapshot, which can forge stat's link count. Run directly
+            # in a non-login backend shell and resolve utilities via default PATH.
+            proc = self._run_bash(transfer, login=False, timeout=_FETCH_TIMEOUT_SECONDS)
+            result = self._wait_for_process(proc, timeout=_FETCH_TIMEOUT_SECONDS)
+        else:
+            result = self.execute(transfer, timeout=_FETCH_TIMEOUT_SECONDS,
+                                  rewrite_compound_background=False)
         output = result.get("output") or ""
         first, last = output.find(marker), output.rfind(marker)
         if int(result.get("returncode") or 0) != 0 or first == -1 or last <= first:

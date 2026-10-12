@@ -81,6 +81,55 @@ class _ScriptedEnv(BaseEnvironment):
         proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
         return {"output": "echo login-noise\n" + proc.stdout + proc.stderr, "returncode": proc.returncode}
 
+    def _run_bash(self, command, *, login=False, timeout=120, stdin_data=None):
+        import subprocess
+        assert not login
+        return subprocess.Popen(["bash", "-c", command], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+
+
+@pytest.mark.parametrize("poison", ["function", "alias", "path"])
+def test_single_link_fetch_ignores_agent_shell_snapshot(tmp_path, poison):
+    """The real execute wrapper must not let session shell state forge stat nlink."""
+    import os
+    import shlex
+
+    secret = tmp_path / "synthetic-secret"
+    secret.write_bytes(b"synthetic credential fixture")
+    alias = tmp_path / "artifact.png"
+    os.link(secret, alias)
+    dest = tmp_path / "copy.png"
+
+    class SnapshotShell(_ScriptedEnv):
+        def __init__(self):
+            BaseEnvironment.__init__(self, str(tmp_path), 5)
+            self._snapshot_path = str(tmp_path / "snapshot.sh")
+            self._cwd_file = str(tmp_path / "cwd.txt")
+            self._snapshot_ready = True
+
+        execute = BaseEnvironment.execute
+
+    env = SnapshotShell()
+    if poison == "function":
+        snapshot = "stat() { echo 1; }\n"
+    elif poison == "alias":
+        snapshot = "shopt -s expand_aliases\nalias stat='echo 1 #'\n"
+    else:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "stat"
+        fake.write_text("#!/bin/sh\necho 1\n", encoding="utf-8")
+        fake.chmod(0o755)
+        snapshot = "export PATH=" + shlex.quote(str(bin_dir)) + ":$PATH\n"
+    Path(env._snapshot_path).write_text(snapshot, encoding="utf-8")
+    with pytest.raises(FileFetchError):
+        env.fetch_file(str(alias), dest, max_bytes=100, require_single_link=True)
+    assert not dest.exists(), "Hard-linked bytes must not reach the delivery cache"
+    ordinary = tmp_path / "ordinary.png"
+    ordinary.write_bytes(b"ordinary artifact")
+    env.fetch_file(str(ordinary), dest, max_bytes=100, require_single_link=True)
+    assert dest.read_bytes() == ordinary.read_bytes()
+
 
 def test_fetch_file_round_trips_bytes_and_enforces_the_in_sandbox_size_cap(tmp_path):
     src = tmp_path / "artifact.bin"
